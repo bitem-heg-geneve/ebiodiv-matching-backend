@@ -1,3 +1,9 @@
+# Context
+
+See https://github.com/bitem-heg-geneve/ebiodiv-matching-frontend/pull/44
+
+This backend saves the occurrence relations including when the user has not made a choice.
+ 
 # How to run
 
 ```

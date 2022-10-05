@@ -1,42 +1,48 @@
-import asyncio
 import logging
-from itertools import chain, islice
-from logging import Logger
-from time import time
-from typing import Dict, List, Optional, Union
-
-import aiohttp
+import hashlib
 import orjson
-from fastapi import Body, FastAPI, Query, Request, Response
+from typing import Dict, List, Optional, Any
+
+from fastapi import Body, FastAPI, Request, Query, Depends
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
-from . import matchingalgorithm, server, utils
+from . import server, storage
 
 logger = logging.getLogger(__name__)
 
 CONFIG = server.CONFIG
-HTTP_SESSION: aiohttp.ClientSession = None
-DATASOURCE = CONFIG["datasource"]
+
 
 app = FastAPI(
-    title="eBioDiv - Backend API",
-    version="2.0.0",
+    title="eBioDiv - SIB server",
+    version="3.0.0",
     docs_url="/",
     redoc_url=None,
     default_response_class=ORJSONResponse,
     swagger_ui_parameters={"syntaxHighlight": False},
     description="""
-<p>See the <a href="https://candy.text-analytics.ch/eBioDiv/">project page</a></p>
+<p>Store occurrence relations of ebiodiv.org</p>
 
-<p>Front-end deployed at <a href='https://candy.text-analytics.ch/eBioDiv/demo/'>https://candy.text-analytics.ch/eBioDiv/demo/</a></p>
-
-<p>This API mostly proxies the Plazi API at <a href="https://tb.plazi.org/GgServer/gbifOccLinkData/">https://tb.plazi.org/GgServer/gbifOccLinkData/</a>,
-but add scoring between the occurrences</p>
+<p><a href='https://github.com/bitem-heg-geneve/ebiodiv-matching-backend'>Source code</a></p>
 """,
 )
+
+
+# Dependency
+def get_db() -> storage.Session:
+    db = storage.getSession()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+async def startup_event():
+    storage.initialize(CONFIG['database']['url'])
 
 
 async def catch_exceptions_middleware(request: Request, call_next):
@@ -70,160 +76,158 @@ app.add_middleware(
 
 server.configure_app(app)
 
-async def on_request_end(session, trace_config_ctx, params):
-    logger.info(f"\"{params.method} {params.url}\" {params.response.status} {params.response.headers.get('content-length', '')}")
+
+class OcurrenceRelation(BaseModel):
+    occurrence: Dict[str, Any]
+    decision: Optional[bool]
+    is_new_decision: bool
 
 
-@app.on_event("startup")
-async def startup_event():
-    """create HTTP client & log outgoing HTTP request"""
-    global HTTP_SESSION
-    trace_config = aiohttp.TraceConfig()
-    trace_config.on_request_end.append(on_request_end)
-    timeout = aiohttp.ClientTimeout(float(DATASOURCE["timeout"]))
-    HTTP_SESSION = aiohttp.ClientSession(trace_configs=[trace_config], timeout=timeout, headers={
-        'User-Agent': 'ebiodiv-backend'
-    })
+class User(BaseModel):
+    name: str
+    orcid: Optional[str]
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await HTTP_SESSION.close()
+class OccurrenceRelationsModel(BaseModel):
+    institutionKey: str 
+    datasetKey:str
+    user: User
+    refOccurrence: Dict[str, Any]
+    relations: List[OcurrenceRelation]
 
 
-class Fields(BaseModel):
-    __root__: Dict[str, List[str]]
+def get_user(session: storage.Session, user: User) -> storage.User:
+    userObj = session.query(storage.User).where(storage.User.name==user.name and storage.User.orcid==user.orcid).scalar()
+    if userObj is None:
+        userObj = storage.User(name=user.name, orcid=user.orcid)
+        session.add(userObj)
+        session.commit()
+    return userObj
 
 
-async def proxy_response(url, method='get', **kwargs):
-    with utils.measure_time() as now:
-        async with getattr(HTTP_SESSION, method)(url, **kwargs) as response:
-            content = await response.read()
-            http_time = now()
-            return Response(
-                content,
-                status_code=response.status,
-                media_type=response.headers["Content-Type"],
-                headers = {
-                    'server-timing': 'http;dur=' + str(round(http_time * 1000))
-                }
-            )
+def get_hash(b: bytes):
+    m = hashlib.sha256()
+    m.update(b)
+    return m.hexdigest()
 
 
-@app.get("/fields", response_model=Fields, description="List of fields", tags=["meta"])
-async def get_fields():
-    result = {column_name: [column_name] for column_name in matchingalgorithm.FIELDS}
-    result.update({column_names[0]: list(column_names) for column_names in matchingalgorithm.MULTI_FIELDS})
-    return result
+def get_occurrence(session: storage.Session, occurrence: Dict[str, Any]) -> storage.Occurrence:
+    key = occurrence['key']
+    data = orjson.dumps(occurrence)
+    dataHash = get_hash(data)
+    occurrenceObj = session.query(storage.Occurrence).where(storage.Occurrence.dataHash==dataHash).scalar()
+    if occurrenceObj is None:
+        occurrenceObj = storage.Occurrence(
+            gbifKey=key,
+            datasetKey=occurrence.get('datasetKey'),
+            institutionKey=occurrence.get('institutionKey'),
+            publishingOrgKey=occurrence.get('publishingOrgKey'),
+            data=data.decode(),
+            dataHash=dataHash,
+        )
+        session.add(occurrenceObj)
+        session.commit()
+    return occurrenceObj
 
 
-@app.get("/institutionList", description="basic list of institutions, including datasets", tags=["data"])
-async def get_institutionList():
-    return await proxy_response(DATASOURCE["url"] + "institutionList")
-
-
-@app.get("/institutions", description="list of full institution record", tags=["data"])
-async def get_institutions():
-    return await proxy_response(DATASOURCE["url"] + "institutions")
-
-
-@app.get("/datasets", description="list of datasets", tags=["data"])
-async def get_datasets(institutionKey: Optional[str] = None):
-    params = {}
-    if institutionKey:
-        params["institutionKey"] = institutionKey
-    return await proxy_response(DATASOURCE["url"] + "datasets", params=params)
-
-
-def _add_score(data) -> None:
-    # normalized a copy of the occurrences
-    normalized_occ_dict = {}
-    for occ_key, occ in data["occurrences"].items():
-        normalized_occ = occ.copy()
-        matchingalgorithm.normalize_occurrence(normalized_occ)
-        normalized_occ_dict[int(occ_key)] = normalized_occ
-
-    # get the scores from the normalized occurrences
-    # leave the original occurrences untouched
-    for relation in data["occurrenceRelations"]:
-        o1 = normalized_occ_dict[relation["occurrenceKey1"]]
-        o2 = normalized_occ_dict[relation["occurrenceKey2"]]
-        relation["scores"] = matchingalgorithm.get_scores(o1, o2)
-    return data
-
-
-@app.get("/occurrences", description="list of occurrences", tags=["data"])
-async def get_occurrences(
-    institutionKey: Optional[str] = None,
-    datasetKey: Optional[str] = None,
-    occurrenceKeys: Optional[str] = None,
-    fetchMissing: Optional[bool] = Query(default=None, description="Fetch missing occurrences, allow to add new occurrences"),
-    scores: bool = False
-):
-    params = {}
-    if institutionKey is not None:
-        params["institutionKey"] = institutionKey
-    if datasetKey is not None:
-        params["datasetKey"] = datasetKey
-    if occurrenceKeys is not None:
-        params["occurrenceKeys"] = occurrenceKeys
-    if fetchMissing is not None:
-        params["fetchMissing"] = "true" if fetchMissing else "false"
-
-    timings = {}
-
-    with utils.measure_time() as now:
-        async with HTTP_SESSION.get(DATASOURCE["url"] + "occurrences", params=params) as response:
-            if response.status != 200 or not scores:
-                # error: proxy the response
-                content = await response.read()
-                http_time = now()
-                return Response(
-                    content,
-                    status_code=response.status,
-                    media_type=response.headers["Content-Type"],
-                    headers = {
-                        'server-timing': 'http;dur=' + str(round(http_time * 1000))
-                    }
-                )
-
-            content = await response.read()
-    timings['http'] = now()
-
-    with utils.measure_time() as now:
-        # orjson.loads(content) takes a few seconds on a large documents (>10MB).
-        data = orjson.loads(content)
-    timings['json_loads'] = now()
-
-    # add scores
-    with utils.measure_time() as now:
-        if scores:
-            await asyncio.get_event_loop().run_in_executor(None, _add_score, data)
-    timings['scoring'] = now()
-
-    # serialize JSON
-    with utils.measure_time() as now:
-        content = orjson.dumps(data)
-    timings['json_dumps'] = now()
-
-    # output server-timing HTTP header
-    # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server-Timing
-    # https://twitter.com/firefoxdevtools/status/1201914691863244800
-    timings_values = [
-        name + ';dur=' + str(round(value * 1000, 3))
-        for name, value in timings.items()
+@app.post("/newOcurrenceRelations")
+async def occurrenceRelations(data: OccurrenceRelationsModel, session: storage.Session = Depends(get_db)):
+    user = get_user(session, data.user)
+    relationsObj = [
+        storage.OccurrenceRelation(
+            relatedOccurrenceId=get_occurrence(session, relation.occurrence).id,
+            decision=relation.decision,
+            isNewDecision=relation.is_new_decision,
+        )
+        for relation in data.relations
     ]
 
-    return Response(
-        orjson.dumps(data),
-        status_code=response.status,
-        media_type="application/json",
-        headers = {
-            'server-timing': ', '.join(timings_values)
+    # commit the event
+    session.add(storage.Event(
+        userId=user.id,
+        institutionKey=data.institutionKey,
+        datasetKey=data.datasetKey,
+        refOccurrenceId=get_occurrence(session, data.refOccurrence).id,
+        relations=relationsObj,
+    ))
+    session.commit()
+    return {'ok': True}
+
+
+@app.post('/occurrences')
+async def occurrences(
+    occurrenceIds: Optional[List[int]],
+    session: storage.Session = Depends(get_db)
+):
+    occurrences = {}
+    r = session.query(storage.Occurrence).where(storage.Occurrence.id.in_(occurrenceIds)).all()
+    for occ in r:
+        occ: storage.Occurrence = occ
+        occurrences[occ.id] = orjson.loads(occ.data)
+    return occurrences
+
+
+@app.get("/occurrenceRelations")
+async def events(
+    institutionKey: Optional[str] = None,
+    datasetKey: Optional[str] = None,
+    occurrenceKey: Optional[int] = None,
+    eventId: Optional[int] = None,
+    withOccurrence: bool = False,
+    session: storage.Session = Depends(get_db)
+):
+    q = session.query(storage.Event).join(storage.User, storage.User.id==storage.Event.userId).join(storage.Occurrence, storage.Occurrence.id==storage.Event.refOccurrenceId)
+    if institutionKey:
+        q = q.where(storage.Occurrence.institutionKey == institutionKey)
+    if datasetKey:
+        q = q.where(storage.Occurrence.datasetKey == datasetKey)
+    if occurrenceKey:
+        q = q.where(storage.Occurrence.gbifKey == occurrenceKey)
+    if eventId:
+        q = q.where(storage.Event.id == eventId)
+    events = []
+
+    occurrenceIdSet = set()
+    def addToOccurrenceIdSet(occId):
+        nonlocal occurrenceIdSet
+        if withOccurrence:
+            occurrenceIdSet.add(occId)
+        return occId
+
+    events = [
+        {
+            'id': event.id,
+            'timestamp': event.timestamp,
+            'user': {
+                'name': event.user.name,
+                'orcid': event.user.orcid, 
+            },
+            'refOccurrenceId': addToOccurrenceIdSet(event.refOccurrenceId),
+            'refOccurrenceKey': event.refOccurrence.gbifKey,
+            'datasetKey': event.refOccurrence.datasetKey,
+            'institutionKey': event.refOccurrence.institutionKey,
+            'publishingOrgKey': event.refOccurrence.publishingOrgKey,
+            'relations': [
+                {
+                    'relatedOccurrenceId': addToOccurrenceIdSet(r.relatedOccurrenceId),
+                    'decision': r.decision,
+                    'is_new_decision': r.isNewDecision,
+                }
+                for r in event.relations
+            ]
         }
-    )
+        for event in q.all()
+    ]
+    results = {
+        'events': events
+    }
 
+    if withOccurrence:
+        occurrences = {}
+        r = session.query(storage.Occurrence).where(storage.Occurrence.id.in_(occurrenceIdSet)).all()
+        for occ in r:
+            occ: storage.Occurrence = occ
+            occurrences[occ.id] = orjson.loads(occ.data)
+        results['occurrences'] = occurrences
 
-@app.post("/occurrenceRelations", description='Update the "match" value between occurrences', tags=["matching"])
-async def occurrence_relations(data = Body(default=None, example="""{"occurrenceRelations":[{"occurrenceKey1":20,"occurrenceKey2":42,"decision":null},{"occurrenceKey1":20,"occurrenceKey2":42,"decision":true},{"occurrenceKey1":20,"occurrenceKey2":42,"decision":false}]}""")):
-    return await proxy_response(DATASOURCE["url"] + "occurrenceRelations", method='post', json=data)
+    return results
